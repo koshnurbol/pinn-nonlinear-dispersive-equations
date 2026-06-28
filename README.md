@@ -58,12 +58,13 @@ USE_ENERGY_LOSS = True            # add the invariant-preserving penalty
 USE_LBFGS = True                  # apply L-BFGS refinement after Adam
 ```
 
-To run a single experiment:
+To run a single experiment from the repository root:
 
 ```bash
-cd src
-python pinn_kdv.py
-```
+python src/pinn_kdv.py
+python src/pinn_bbm.py
+python src/pinn_kawahara.py
+python src/pinn_rosenau.py
 
 Each run prints the metrics (final-time relative L2, space-time L2, PDE residual,
 energy drift, training time), appends a row to a per-equation CSV file, and saves
@@ -105,11 +106,11 @@ The reported values are the mean ± sample standard deviation over the three see
 ## Reproducing the spectral-error analysis (Kawahara)
 
 The Fourier error-spectrum figure and the phase-decomposition control are produced
-from a trained Kawahara model. First train and save the model:
+from a trained Kawahara model. First train and save the model from the repository
+root:
 
 ```bash
-cd src
-python pinn_kawahara.py          # writes kawahara_standard_pinn_model.pt
+python src/pinn_kawahara.py
 ```
 
 Then run the diagnostics from the same directory (so the `.pt` file is found):
