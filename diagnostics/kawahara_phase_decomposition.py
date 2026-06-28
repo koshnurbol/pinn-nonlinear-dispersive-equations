@@ -1,173 +1,374 @@
-import torch
-import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
+"""
+Phase-shift and spectral-control diagnostic for the Kawahara PINN.
+
+This script loads a trained Kawahara PINN model and checks whether the observed
+high-wavenumber error content can be explained by a simple rigid phase shift.
+It computes the final-time error before and after removing the optimal phase
+shift and compares their spatial Fourier spectra.
+
+Expected model file:
+    models/kawahara_standard_pinn_model.pt
+
+Run from the repository root:
+    python diagnostics/kawahara_phase_decomposition.py
+"""
+
+from pathlib import Path
 import math
 
-torch.manual_seed(42)
+import numpy as np
+import torch
+import torch.nn as nn
+import matplotlib.pyplot as plt
 
-# ==========================================
-# НАСТРОЙКИ (должны совпадать с обучением)
-# ==========================================
+
+# ============================================================
+# 0. PATHS
+# ============================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+MODELS_DIR = ROOT_DIR / "models"
+RESULTS_DIR = ROOT_DIR / "results" / "raw" / "kawahara"
+FIGURES_DIR = ROOT_DIR / "figures" / "generated" / "kawahara"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_CANDIDATES = [
+    MODELS_DIR / "kawahara_standard_pinn_model.pt",
+    ROOT_DIR / "src" / "kawahara_standard_pinn_model.pt",
+    ROOT_DIR / "kawahara_standard_pinn_model.pt",
+]
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+SEED = 42
+USE_INPUT_NORMALIZATION = True
+
 L = 20.0
 T_max = 2.0
+
+N_GRID = 4000
+APPLY_HANN_WINDOW = True
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-# ==========================================
-# ТОЧНОЕ РЕШЕНИЕ
-# ==========================================
+
+# ============================================================
+# 2. EXACT KAWAHARA SOLITON
+# ============================================================
+
 def exact_kawahara(x, t, x0=-5.0):
+    """
+    Exact solitary wave for:
+
+        u_t + u*u_x + u_xxx - u_xxxxx = 0
+
+    u(x,t) = 105/169 * sech^4(k * (x - v*t - x0)),
+    where v = 36/169 and k = 1/(2*sqrt(13)).
+    """
     v = 36.0 / 169.0
     amp = 105.0 / 169.0
     k = 1.0 / (2.0 * math.sqrt(13.0))
+
     arg = k * (x - v * t - x0)
     return amp * (1.0 / torch.cosh(arg)) ** 4
 
 
-# ==========================================
-# АРХИТЕКТУРА (идентична обучающему скрипту)
-# ==========================================
+# ============================================================
+# 3. PINN ARCHITECTURE
+# ============================================================
+
 class Kawahara_PINN(nn.Module):
     def __init__(self, width=256, depth=4):
         super().__init__()
-        layers = [nn.Linear(2, width), nn.Tanh()]
+
+        layers = []
+        layers.append(nn.Linear(2, width))
+        layers.append(nn.Tanh())
+
         for _ in range(depth - 1):
-            layers += [nn.Linear(width, width), nn.Tanh()]
-        layers += [nn.Linear(width, 1)]
+            layers.append(nn.Linear(width, width))
+            layers.append(nn.Tanh())
+
+        layers.append(nn.Linear(width, 1))
+
         self.net = nn.Sequential(*layers)
 
     def forward(self, x, t):
-        x_norm = x / L
-        t_norm = 2.0 * t / T_max - 1.0
-        inp = torch.cat([x_norm, t_norm], dim=1)
+        if USE_INPUT_NORMALIZATION:
+            x_in = x / L
+            t_in = 2.0 * t / T_max - 1.0
+        else:
+            x_in = x
+            t_in = t
+
+        inp = torch.cat([x_in, t_in], dim=1)
         return self.net(inp)
 
 
+# ============================================================
+# 4. LOAD TRAINED MODEL
+# ============================================================
+
+def find_model_path():
+    for path in MODEL_CANDIDATES:
+        if path.exists():
+            return path
+
+    candidates = "\n".join(f"  - {p}" for p in MODEL_CANDIDATES)
+    raise FileNotFoundError(
+        "Could not find a trained Kawahara model.\n"
+        "Run the Kawahara training script first:\n\n"
+        "    python src/pinn_kawahara.py\n\n"
+        "Expected one of:\n"
+        f"{candidates}"
+    )
+
+
+model_path = find_model_path()
+
 model = Kawahara_PINN(width=256, depth=4).to(device)
-model.load_state_dict(torch.load("kawahara_standard_pinn_model.pt", map_location=device))
+
+try:
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
+except TypeError:
+    state_dict = torch.load(model_path, map_location=device)
+
+model.load_state_dict(state_dict)
 model.eval()
-print("Модель загружена из kawahara_standard_pinn_model.pt")
+
+print("=" * 80)
+print("Kawahara phase-shift and spectral-control diagnostic")
+print(f"Device     : {device}")
+print(f"Model file : {model_path}")
+print("=" * 80)
 
 
-# ==========================================
-# 1. ВЫЧИСЛЕНИЕ ОПТИМАЛЬНОГО ФАЗОВОГО СДВИГА
-#    Ищем сдвиг s, минимизирующий ||u_pred(x) - u_exact(x - s)||
-#    через сравнение положений пиков (высокое разрешение).
-# ==========================================
-N = 4000
+# ============================================================
+# 5. FINAL-TIME PROFILES
+# ============================================================
+
 with torch.no_grad():
-    x = torch.linspace(-L, L, N).view(-1, 1).to(device)
+    x = torch.linspace(-L, L, N_GRID).view(-1, 1).to(device)
     t = torch.full_like(x, T_max)
-    u_pred = model(x, t).cpu().numpy().ravel()
-    u_exact = exact_kawahara(x, t).cpu().numpy().ravel()
-xg = x.cpu().numpy().ravel()
 
-# положение пиков
-i_pred = np.argmax(u_pred)
-i_exact = np.argmax(u_exact)
-peak_shift = xg[i_pred] - xg[i_exact]
-amp_pred = u_pred[i_pred]
-amp_exact = u_exact[i_exact]
+    u_pred = model(x, t).detach().cpu().numpy().reshape(-1)
+    u_exact = exact_kawahara(x, t).detach().cpu().numpy().reshape(-1)
 
-print("\n--- Пик / амплитуда / фаза ---")
-print(f"Пик exact   : A={amp_exact:.5f} @ x={xg[i_exact]:.4f}")
-print(f"Пик PINN    : A={amp_pred:.5f} @ x={xg[i_pred]:.4f}")
-print(f"Ошибка амплитуды : {abs(amp_pred-amp_exact)/amp_exact*100:.4f}%")
-print(f"Фазовый сдвиг    : dx = {peak_shift:+.4f}")
+x_grid = x.detach().cpu().numpy().reshape(-1)
 
-# уточняем сдвиг минимизацией L2 по сетке кандидатов вокруг peak_shift
+
+# ============================================================
+# 6. PEAK-BASED INITIAL PHASE-SHIFT ESTIMATE
+# ============================================================
+
+i_pred = int(np.argmax(u_pred))
+i_exact = int(np.argmax(u_exact))
+
+peak_shift = float(x_grid[i_pred] - x_grid[i_exact])
+
+amp_pred = float(u_pred[i_pred])
+amp_exact = float(u_exact[i_exact])
+amp_rel_error = abs(amp_pred - amp_exact) / (abs(amp_exact) + 1e-30)
+
+print("\n--- Peak, amplitude, and initial phase estimate ---")
+print(f"Exact peak amplitude : A = {amp_exact:.8f} at x = {x_grid[i_exact]:+.6f}")
+print(f"PINN peak amplitude  : A = {amp_pred:.8f} at x = {x_grid[i_pred]:+.6f}")
+print(f"Relative amplitude error : {100.0 * amp_rel_error:.6f}%")
+print(f"Peak-based phase shift   : dx = {peak_shift:+.6f}")
+
+
+# ============================================================
+# 7. L2-OPTIMAL RIGID PHASE SHIFT
+# ============================================================
+
 shift_candidates = np.linspace(peak_shift - 0.5, peak_shift + 0.5, 2001)
-best_shift, best_err = peak_shift, np.inf
-for s in shift_candidates:
-    with torch.no_grad():
-        xs = torch.linspace(-L, L, N).view(-1, 1).to(device)
-        ts = torch.full_like(xs, T_max)
-        u_e_shift = exact_kawahara(xs - s, ts).cpu().numpy().ravel()
-    e = np.linalg.norm(u_pred - u_e_shift) / np.linalg.norm(u_e_shift)
-    if e < best_err:
-        best_err, best_shift = e, s
 
-print(f"Оптимальный сдвиг (L2-min): s = {best_shift:+.4f}")
+best_shift = peak_shift
+best_err = np.inf
 
-
-# ==========================================
-# 2. РАЗЛОЖЕНИЕ ОШИБКИ
-#    err_raw      = u_pred - u_exact          (полная ошибка)
-#    err_dephased = u_pred - u_exact(x - s*)  (после снятия фазы)
-# ==========================================
 with torch.no_grad():
-    xs = torch.linspace(-L, L, N).view(-1, 1).to(device)
-    ts = torch.full_like(xs, T_max)
-    u_e_shift = exact_kawahara(xs - best_shift, ts).cpu().numpy().ravel()
+    x_torch = torch.linspace(-L, L, N_GRID).view(-1, 1).to(device)
+    t_torch = torch.full_like(x_torch, T_max)
+
+    for shift in shift_candidates:
+        u_exact_shifted = (
+            exact_kawahara(x_torch - shift, t_torch)
+            .detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+        )
+
+        err = np.linalg.norm(u_pred - u_exact_shifted) / (
+            np.linalg.norm(u_exact_shifted) + 1e-30
+        )
+
+        if err < best_err:
+            best_err = float(err)
+            best_shift = float(shift)
+
+with torch.no_grad():
+    u_exact_shifted = (
+        exact_kawahara(x_torch - best_shift, t_torch)
+        .detach()
+        .cpu()
+        .numpy()
+        .reshape(-1)
+    )
+
+print(f"L2-optimal phase shift    : s = {best_shift:+.6f}")
+
+
+# ============================================================
+# 8. ERROR BEFORE AND AFTER PHASE REMOVAL
+# ============================================================
 
 err_raw = u_pred - u_exact
-err_dephased = u_pred - u_e_shift
+err_dephased = u_pred - u_exact_shifted
 
-l2_raw = np.linalg.norm(err_raw) / np.linalg.norm(u_exact)
-l2_dephased = np.linalg.norm(err_dephased) / np.linalg.norm(u_e_shift)
+l2_raw = np.linalg.norm(err_raw) / (np.linalg.norm(u_exact) + 1e-30)
+l2_dephased = np.linalg.norm(err_dephased) / (
+    np.linalg.norm(u_exact_shifted) + 1e-30
+)
 
-print("\n--- L2 ошибки до/после снятия фазы ---")
-print(f"L2 полная ошибка        : {l2_raw:.4e}")
-print(f"L2 после снятия фазы    : {l2_dephased:.4e}")
-print(f"Доля ошибки от фазы     : {(1 - l2_dephased/l2_raw)*100:.1f}%")
+phase_error_fraction = 1.0 - l2_dephased / (l2_raw + 1e-30)
 
-
-# ==========================================
-# 3. СПЕКТР ДО И ПОСЛЕ СНЯТИЯ ФАЗЫ
-# ==========================================
-dx_fft = (2.0 * L) / (N - 1)
-k = np.fft.rfftfreq(N, d=dx_fft) * 2.0 * np.pi
-
-P_exact = np.abs(np.fft.rfft(u_exact)) ** 2
-P_raw = np.abs(np.fft.rfft(err_raw)) ** 2
-P_deph = np.abs(np.fft.rfft(err_dephased)) ** 2
+print("\n--- Relative L2 errors before and after phase removal ---")
+print(f"Raw relative L2 error        : {l2_raw:.8e}")
+print(f"Dephased relative L2 error   : {l2_dephased:.8e}")
+print(f"Phase-removable error share  : {100.0 * phase_error_fraction:.4f}%")
 
 
-def centroid(P):
-    return float(np.sum(k * P) / (np.sum(P) + 1e-30))
+# ============================================================
+# 9. SPECTRA BEFORE AND AFTER PHASE REMOVAL
+# ============================================================
+
+dx_fft = (2.0 * L) / (N_GRID - 1)
+k_fft = np.fft.rfftfreq(N_GRID, d=dx_fft) * 2.0 * np.pi
+
+if APPLY_HANN_WINDOW:
+    window = np.hanning(N_GRID)
+else:
+    window = np.ones(N_GRID)
+
+u_exact_w = u_exact * window
+err_raw_w = err_raw * window
+err_dephased_w = err_dephased * window
+
+P_exact = np.abs(np.fft.rfft(u_exact_w)) ** 2
+P_raw = np.abs(np.fft.rfft(err_raw_w)) ** 2
+P_dephased = np.abs(np.fft.rfft(err_dephased_w)) ** 2
 
 
-c_exact = centroid(P_exact)
-c_raw = centroid(P_raw)
-c_deph = centroid(P_deph)
-
-print("\n--- Спектральные центроиды ---")
-print(f"Центроид решения              : k = {c_exact:.4f}")
-print(f"Центроид ошибки (raw)         : k = {c_raw:.4f}   ratio={c_raw/c_exact:.2f}")
-print(f"Центроид ошибки (без фазы)    : k = {c_deph:.4f}   ratio={c_deph/c_exact:.2f}")
-print(f"Снижение центроида ошибки     : {(1 - c_deph/c_raw)*100:.1f}%")
-
-hi = k > 2 * c_exact
-print(f"\nHigh-k доля энергии:")
-print(f"  решение            : {np.sum(P_exact[hi])/np.sum(P_exact):.4f}")
-print(f"  ошибка raw         : {np.sum(P_raw[hi])/np.sum(P_raw):.4f}")
-print(f"  ошибка без фазы    : {np.sum(P_deph[hi])/np.sum(P_deph):.4f}")
+def spectral_centroid(k, power):
+    return float(np.sum(k * power) / (np.sum(power) + 1e-30))
 
 
-# ==========================================
-# 4. ГРАФИК
-# ==========================================
-P_exact_n = P_exact / (P_exact.max() + 1e-30)
-P_raw_n = P_raw / (P_raw.max() + 1e-30)
-P_deph_n = P_deph / (P_deph.max() + 1e-30)
+c_exact = spectral_centroid(k_fft, P_exact)
+c_raw = spectral_centroid(k_fft, P_raw)
+c_dephased = spectral_centroid(k_fft, P_dephased)
+
+high_k_mask = k_fft > (2.0 * c_exact)
+
+high_k_exact = float(np.sum(P_exact[high_k_mask]) / (np.sum(P_exact) + 1e-30))
+high_k_raw = float(np.sum(P_raw[high_k_mask]) / (np.sum(P_raw) + 1e-30))
+high_k_dephased = float(
+    np.sum(P_dephased[high_k_mask]) / (np.sum(P_dephased) + 1e-30)
+)
+
+print("\n--- Spectral centroids ---")
+print(f"Solution centroid            : k = {c_exact:.8f}")
+print(f"Raw error centroid           : k = {c_raw:.8f}  ratio = {c_raw / (c_exact + 1e-30):.4f}")
+print(f"Dephased error centroid      : k = {c_dephased:.8f}  ratio = {c_dephased / (c_exact + 1e-30):.4f}")
+print(f"Centroid reduction after dephasing : {100.0 * (1.0 - c_dephased / (c_raw + 1e-30)):.4f}%")
+
+print("\n--- High-k energy fractions ---")
+print(f"Solution high-k fraction     : {high_k_exact:.8f}")
+print(f"Raw error high-k fraction    : {high_k_raw:.8f}")
+print(f"Dephased high-k fraction     : {high_k_dephased:.8f}")
+print("High-k is defined as k > 2 * solution centroid.")
+
+
+# ============================================================
+# 10. SAVE METRICS
+# ============================================================
+
+metrics_path = RESULTS_DIR / "kawahara_phase_decomposition_metrics.txt"
+
+with open(metrics_path, "w", encoding="utf-8") as f:
+    f.write("Kawahara phase-shift and spectral-control diagnostic\n")
+    f.write(f"Model file                              = {model_path}\n")
+    f.write(f"N_GRID                                  = {N_GRID}\n")
+    f.write(f"Apply Hann window                       = {APPLY_HANN_WINDOW}\n")
+    f.write(f"Exact peak amplitude                    = {amp_exact:.12e}\n")
+    f.write(f"PINN peak amplitude                     = {amp_pred:.12e}\n")
+    f.write(f"Relative amplitude error                = {amp_rel_error:.12e}\n")
+    f.write(f"Peak-based phase shift                  = {peak_shift:.12e}\n")
+    f.write(f"L2-optimal phase shift                  = {best_shift:.12e}\n")
+    f.write(f"Raw relative L2 error                   = {l2_raw:.12e}\n")
+    f.write(f"Dephased relative L2 error              = {l2_dephased:.12e}\n")
+    f.write(f"Phase-removable error share             = {phase_error_fraction:.12e}\n")
+    f.write(f"Solution spectral centroid              = {c_exact:.12e}\n")
+    f.write(f"Raw error spectral centroid             = {c_raw:.12e}\n")
+    f.write(f"Dephased error spectral centroid        = {c_dephased:.12e}\n")
+    f.write(f"Raw centroid ratio                      = {c_raw / (c_exact + 1e-30):.12e}\n")
+    f.write(f"Dephased centroid ratio                 = {c_dephased / (c_exact + 1e-30):.12e}\n")
+    f.write(f"Solution high-k fraction                = {high_k_exact:.12e}\n")
+    f.write(f"Raw error high-k fraction               = {high_k_raw:.12e}\n")
+    f.write(f"Dephased error high-k fraction          = {high_k_dephased:.12e}\n")
+
+spectra_path = RESULTS_DIR / "kawahara_phase_decomposition_spectra.csv"
+
+P_exact_norm = P_exact / (P_exact.max() + 1e-30)
+P_raw_norm = P_raw / (P_raw.max() + 1e-30)
+P_dephased_norm = P_dephased / (P_dephased.max() + 1e-30)
+
+np.savetxt(
+    spectra_path,
+    np.column_stack([k_fft, P_exact_norm, P_raw_norm, P_dephased_norm]),
+    delimiter=",",
+    header="k,exact_solution_spectrum,raw_error_spectrum,dephased_error_spectrum",
+    comments="",
+)
+
+
+# ============================================================
+# 11. SAVE FIGURE
+# ============================================================
 
 plt.figure(figsize=(8, 5))
-plt.semilogy(k, P_exact_n, 'k-', lw=2, label='Exact solution')
-plt.semilogy(k, P_raw_n, 'r--', lw=2, label='Error (raw)')
-plt.semilogy(k, P_deph_n, 'b-.', lw=2, label='Error (phase removed)')
-plt.axvline(c_exact, color='k', ls=':', alpha=0.6)
-plt.axvline(c_raw, color='r', ls=':', alpha=0.6)
-plt.axvline(c_deph, color='b', ls=':', alpha=0.6)
+plt.semilogy(k_fft, P_exact_norm, linewidth=2, label="Exact solution")
+plt.semilogy(k_fft, P_raw_norm, linestyle="--", linewidth=2, label="Error, raw")
+plt.semilogy(k_fft, P_dephased_norm, linestyle="-.", linewidth=2, label="Error, phase removed")
+
+plt.axvline(c_exact, linestyle=":", alpha=0.8, label=f"Solution centroid k={c_exact:.2f}")
+plt.axvline(c_raw, linestyle=":", alpha=0.8, label=f"Raw error centroid k={c_raw:.2f}")
+plt.axvline(c_dephased, linestyle=":", alpha=0.8, label=f"Dephased error centroid k={c_dephased:.2f}")
+
 plt.xlabel("Wavenumber $k$")
 plt.ylabel("Normalized power spectrum")
 plt.title("Kawahara: error spectrum before/after phase removal")
 plt.xlim(0, 10)
 plt.ylim(1e-12, 2.0)
-plt.grid(True, which='both', alpha=0.3)
+plt.grid(True, which="both", alpha=0.3)
 plt.legend(fontsize=9)
 plt.tight_layout()
-plt.savefig("kawahara_error_spectrum_dephased.png", dpi=150)
-plt.show()
 
-print("\nГрафик сохранён: kawahara_error_spectrum_dephased.png")
+figure_path = FIGURES_DIR / "kawahara_error_spectrum_dephased.png"
+plt.savefig(figure_path, dpi=300, bbox_inches="tight")
+plt.close()
+
+print("\nSaved outputs:")
+print(f"  - {metrics_path}")
+print(f"  - {spectra_path}")
+print(f"  - {figure_path}")
