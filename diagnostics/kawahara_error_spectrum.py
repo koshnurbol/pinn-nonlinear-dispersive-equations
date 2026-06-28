@@ -1,21 +1,78 @@
+"""
+Fourier error-spectrum diagnostic for the Kawahara PINN.
+
+This script loads a trained Kawahara PINN model and computes the Hann-windowed
+spatial power spectra of the exact solution and of the PINN error at the final
+time. It is intended to reproduce the spectral-error analysis reported in the
+paper.
+
+Expected model file:
+    models/kawahara_standard_pinn_model.pt
+
+Run from the repository root:
+    python diagnostics/kawahara_error_spectrum.py
+"""
+
+from pathlib import Path
+import math
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
-import numpy as np
-import math
-import time
-
-torch.manual_seed(42)
 
 
-# ==========================================
-# 1. ТОЧНОЕ РЕШЕНИЕ КАВАХАРЫ
-# ==========================================
+# ============================================================
+# 0. PATHS
+# ============================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+MODELS_DIR = ROOT_DIR / "models"
+RESULTS_DIR = ROOT_DIR / "results" / "raw" / "kawahara"
+FIGURES_DIR = ROOT_DIR / "figures" / "generated" / "kawahara"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_CANDIDATES = [
+    MODELS_DIR / "kawahara_standard_pinn_model.pt",
+    ROOT_DIR / "src" / "kawahara_standard_pinn_model.pt",
+    ROOT_DIR / "kawahara_standard_pinn_model.pt",
+]
+
+
+# ============================================================
+# 1. SETTINGS
+# ============================================================
+
+SEED = 42
+USE_INPUT_NORMALIZATION = True
+
+L = 20.0
+T_max = 2.0
+
+N_FFT = 2048
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+
+
+# ============================================================
+# 2. EXACT KAWAHARA SOLITON
+# ============================================================
+
 def exact_kawahara(x, t, x0=-5.0):
     """
     Exact solitary wave for:
+
         u_t + u*u_x + u_xxx - u_xxxxx = 0
+
+    u(x,t) = 105/169 * sech^4(k * (x - v*t - x0)),
+    where v = 36/169 and k = 1/(2*sqrt(13)).
     """
     v = 36.0 / 169.0
     amp = 105.0 / 169.0
@@ -25,9 +82,10 @@ def exact_kawahara(x, t, x0=-5.0):
     return amp * (1.0 / torch.cosh(arg)) ** 4
 
 
-# ==========================================
-# 2. STANDARD PINN АРХИТЕКТУРА
-# ==========================================
+# ============================================================
+# 3. PINN ARCHITECTURE
+# ============================================================
+
 class Kawahara_PINN(nn.Module):
     def __init__(self, width=256, depth=4):
         super().__init__()
@@ -44,613 +102,173 @@ class Kawahara_PINN(nn.Module):
 
         self.net = nn.Sequential(*layers)
 
-        for m in self.net:
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                nn.init.zeros_(m.bias)
-
     def forward(self, x, t):
-        # Нормализация входов
-        x_norm = x / L
-        t_norm = 2.0 * t / T_max - 1.0
+        if USE_INPUT_NORMALIZATION:
+            x_in = x / L
+            t_in = 2.0 * t / T_max - 1.0
+        else:
+            x_in = x
+            t_in = t
 
-        inp = torch.cat([x_norm, t_norm], dim=1)
+        inp = torch.cat([x_in, t_in], dim=1)
         return self.net(inp)
 
 
-# ==========================================
-# 3. НАСТРОЙКИ
-# ==========================================
-L = 20.0
-T_max = 2.0
+# ============================================================
+# 4. LOAD TRAINED MODEL
+# ============================================================
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def find_model_path():
+    for path in MODEL_CANDIDATES:
+        if path.exists():
+            return path
+
+    candidates = "\n".join(f"  - {p}" for p in MODEL_CANDIDATES)
+    raise FileNotFoundError(
+        "Could not find a trained Kawahara model.\n"
+        "Run the Kawahara training script first:\n\n"
+        "    python src/pinn_kawahara.py\n\n"
+        "Expected one of:\n"
+        f"{candidates}"
+    )
+
+
+model_path = find_model_path()
 
 model = Kawahara_PINN(width=256, depth=4).to(device)
 
-# ВНИМАНИЕ:
-# Для u_xxxxx standard PINN очень тяжёлый.
-# Если будет CUDA out of memory, уменьши batch_size и lbfgs_points.
-batch_size = 1000
-lbfgs_points = 1500
+try:
+    state_dict = torch.load(model_path, map_location=device, weights_only=True)
+except TypeError:
+    state_dict = torch.load(model_path, map_location=device)
 
-lambda_ic = 20.0
-lambda_bc = 1.0
-lambda_energy = 1.0
+model.load_state_dict(state_dict)
+model.eval()
 
-adam_epochs = 10000
-adam_lr = 0.002
-lbfgs_max_iter = 500
-
-print(f"Запуск standard PINN для Кавахары на {device}")
-print("PDE residual: F = u_t + u*u_x + u_xxx - u_xxxxx")
+print("=" * 80)
+print("Kawahara Fourier error-spectrum diagnostic")
+print(f"Device     : {device}")
+print(f"Model file : {model_path}")
+print("=" * 80)
 
 
-# ==========================================
-# 4. AD-ПРОИЗВОДНЫЕ
-# ==========================================
-def grad(outputs, inputs):
-    return torch.autograd.grad(
-        outputs,
-        inputs,
-        grad_outputs=torch.ones_like(outputs),
-        create_graph=True,
-        retain_graph=True
-    )[0]
+# ============================================================
+# 5. SPECTRAL DIAGNOSTICS
+# ============================================================
 
-
-def kawahara_residual_pinn(x, t):
+def spectral_centroid(k, power):
     """
-    Здесь standard PINN решает PDE Кавахары:
-
-        F = u_t + u*u_x + u_xxx - u_xxxxx
-
-    ВАЖНО:
-    Все производные считаются через AD.
+    Spectral centroid: sum(k * P(k)) / sum(P(k)).
     """
-    u = model(x, t)
-
-    u_t = grad(u, t)
-
-    u_x = grad(u, x)
-    u_xx = grad(u_x, x)
-    u_xxx = grad(u_xx, x)
-    u_xxxx = grad(u_xxx, x)
-    u_xxxxx = grad(u_xxxx, x)
-
-    residual = u_t + u * u_x + u_xxx - u_xxxxx
-
-    return residual
+    return float(np.sum(k * power) / (np.sum(power) + 1e-30))
 
 
-# ==========================================
-# 5. ЭНЕРГИЯ
-# ==========================================
-x_energy = torch.linspace(-L, L, 500).view(-1, 1).to(device)
-dx = x_energy[1] - x_energy[0]
+def compute_error_spectrum(N=N_FFT):
+    """
+    Compute Hann-windowed spectra of the exact solution and PINN error
+    at the final time T_max.
+    """
+    x = torch.linspace(-L, L, N).view(-1, 1).to(device)
+    t = torch.full_like(x, T_max)
 
-with torch.no_grad():
-    u_initial_exact = exact_kawahara(x_energy, torch.zeros_like(x_energy))
-    E0 = torch.sum(u_initial_exact ** 2) * dx
+    with torch.no_grad():
+        u_pred = model(x, t).detach().cpu().numpy().reshape(-1)
+        u_exact = exact_kawahara(x, t).detach().cpu().numpy().reshape(-1)
 
+    error = u_pred - u_exact
 
-def compute_energy_pinn(t_scalar):
-    if not torch.is_tensor(t_scalar):
-        t_scalar = torch.tensor(t_scalar, device=device)
+    # Hann window suppresses boundary artifacts from the truncated solitary wave.
+    window = np.hanning(N)
 
-    t_curr = torch.full_like(x_energy, t_scalar)
-    u_curr = model(x_energy, t_curr)
+    u_exact_w = u_exact * window
+    error_w = error * window
 
-    E_curr = torch.sum(u_curr ** 2) * dx
-    return E_curr
+    dx = (2.0 * L) / (N - 1)
 
+    k = np.fft.rfftfreq(N, d=dx) * 2.0 * np.pi
+    power_exact = np.abs(np.fft.rfft(u_exact_w)) ** 2
+    power_error = np.abs(np.fft.rfft(error_w)) ** 2
 
-# ==========================================
-# 6. ОБУЧЕНИЕ ADAM
-# ==========================================
-optimizer_adam = optim.Adam(model.parameters(), lr=adam_lr)
-scheduler = optim.lr_scheduler.StepLR(optimizer_adam, step_size=2500, gamma=0.5)
-
-history_pde = []
-history_ic = []
-history_bc = []
-history_energy = []
-history_total = []
-
-start_time = time.time()
-
-for epoch in range(adam_epochs):
-    optimizer_adam.zero_grad()
-
-    # ------------------------------
-    # PDE collocation
-    # ------------------------------
-    t_col = (torch.rand(batch_size, 1, device=device) * T_max).requires_grad_(True)
-    x_col = ((torch.rand(batch_size, 1, device=device) * 2 * L) - L).requires_grad_(True)
-
-    residual = kawahara_residual_pinn(x_col, t_col)
-    loss_pde = torch.mean(residual ** 2)
-
-    # ------------------------------
-    # Initial condition
-    # ------------------------------
-    t_ic = torch.zeros(batch_size, 1, device=device)
-    x_ic = (torch.rand(batch_size, 1, device=device) * 2 * L) - L
-
-    u_ic_pred = model(x_ic, t_ic)
-    u_ic_exact = exact_kawahara(x_ic, t_ic)
-
-    loss_ic = torch.mean((u_ic_pred - u_ic_exact) ** 2)
-
-    # ------------------------------
-    # Boundary condition
-    # ------------------------------
-    t_bc = torch.rand(batch_size, 1, device=device) * T_max
-
-    x_left = -L * torch.ones(batch_size, 1, device=device)
-    x_right = L * torch.ones(batch_size, 1, device=device)
-
-    u_left_pred = model(x_left, t_bc)
-    u_right_pred = model(x_right, t_bc)
-
-    loss_bc = torch.mean(u_left_pred ** 2) + torch.mean(u_right_pred ** 2)
-
-    # ------------------------------
-    # Energy loss
-    # ------------------------------
-    t_e = torch.rand(3, 1, device=device) * T_max
-
-    loss_energy = 0.0
-    for i in range(3):
-        E_curr = compute_energy_pinn(t_e[i, 0])
-        loss_energy = loss_energy + (E_curr - E0) ** 2
-
-    loss_energy = loss_energy / 3.0
-
-    # ------------------------------
-    # Total loss
-    # ------------------------------
-    loss_total = (
-        loss_pde
-        + lambda_ic * loss_ic
-        + lambda_bc * loss_bc
-        + lambda_energy * loss_energy
-    )
-
-    loss_total.backward()
-
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-    optimizer_adam.step()
-    scheduler.step()
-
-    history_pde.append(loss_pde.item())
-    history_ic.append(loss_ic.item())
-    history_bc.append(loss_bc.item())
-    history_energy.append(loss_energy.item())
-    history_total.append(loss_total.item())
-
-    if epoch % 1000 == 0:
-        print(
-            f"Adam {epoch:5d} | "
-            f"PDE: {loss_pde.item():.5e} | "
-            f"IC: {loss_ic.item():.5e} | "
-            f"BC: {loss_bc.item():.5e} | "
-            f"E: {loss_energy.item():.5e} | "
-            f"Total: {loss_total.item():.5e}"
-        )
+    return k, power_error, power_exact
 
 
-# ==========================================
-# 7. L-BFGS ПОЛИРОВКА
-# ==========================================
-print("\nПолировка L-BFGS для standard PINN...")
+k_fft, power_error, power_exact = compute_error_spectrum(N=N_FFT)
 
-optimizer_lbfgs = optim.LBFGS(
-    model.parameters(),
-    max_iter=lbfgs_max_iter,
-    line_search_fn="strong_wolfe",
-    tolerance_grad=1e-10,
-    tolerance_change=1e-12,
-    history_size=100
+centroid_error = spectral_centroid(k_fft, power_error)
+centroid_exact = spectral_centroid(k_fft, power_exact)
+centroid_ratio = centroid_error / (centroid_exact + 1e-30)
+
+high_k_mask = k_fft > (2.0 * centroid_exact)
+
+high_k_fraction_error = float(
+    np.sum(power_error[high_k_mask]) / (np.sum(power_error) + 1e-30)
 )
 
-t_col_f = (torch.rand(lbfgs_points, 1, device=device) * T_max).requires_grad_(True)
-x_col_f = ((torch.rand(lbfgs_points, 1, device=device) * 2 * L) - L).requires_grad_(True)
-
-t_ic_f = torch.zeros(lbfgs_points, 1, device=device)
-x_ic_f = (torch.rand(lbfgs_points, 1, device=device) * 2 * L) - L
-
-t_bc_f = torch.rand(lbfgs_points, 1, device=device) * T_max
-x_left_f = -L * torch.ones(lbfgs_points, 1, device=device)
-x_right_f = L * torch.ones(lbfgs_points, 1, device=device)
-
-t_e_f = torch.rand(3, 1, device=device) * T_max
-
-lbfgs_iter = 0
-
-
-def closure():
-    global lbfgs_iter
-
-    optimizer_lbfgs.zero_grad()
-
-    # PDE loss
-    residual = kawahara_residual_pinn(x_col_f, t_col_f)
-    loss_pde = torch.mean(residual ** 2)
-
-    # IC loss
-    u_ic_pred = model(x_ic_f, t_ic_f)
-    u_ic_exact = exact_kawahara(x_ic_f, t_ic_f)
-
-    loss_ic = torch.mean((u_ic_pred - u_ic_exact) ** 2)
-
-    # BC loss
-    u_left_pred = model(x_left_f, t_bc_f)
-    u_right_pred = model(x_right_f, t_bc_f)
-
-    loss_bc = torch.mean(u_left_pred ** 2) + torch.mean(u_right_pred ** 2)
-
-    # Energy loss
-    loss_energy_f = 0.0
-    for i in range(3):
-        E_curr = compute_energy_pinn(t_e_f[i, 0])
-        loss_energy_f = loss_energy_f + (E_curr - E0) ** 2
-
-    loss_energy_f = loss_energy_f / 3.0
-
-    loss_total = (
-        loss_pde
-        + lambda_ic * loss_ic
-        + lambda_bc * loss_bc
-        + lambda_energy * loss_energy_f
-    )
-
-    loss_total.backward()
-
-    lbfgs_iter += 1
-
-    if lbfgs_iter % 50 == 0:
-        print(
-            f"L-BFGS {lbfgs_iter:4d} | "
-            f"PDE: {loss_pde.item():.5e} | "
-            f"IC: {loss_ic.item():.5e} | "
-            f"BC: {loss_bc.item():.5e} | "
-            f"E: {loss_energy_f.item():.5e} | "
-            f"Total: {loss_total.item():.5e}"
-        )
-
-    return loss_total
-
-
-optimizer_lbfgs.step(closure)
-
-training_time = time.time() - start_time
-
-print("Обучение standard PINN завершено!")
-print(f"Время обучения: {training_time:.2f} секунд")
-
-
-# ==========================================
-# 8. МЕТРИКИ
-# ==========================================
-def relative_l2(u_pred, u_exact, mask=None):
-    if mask is not None:
-        u_pred = u_pred[mask]
-        u_exact = u_exact[mask]
-
-    return (torch.norm(u_pred - u_exact, 2) / torch.norm(u_exact, 2)).item()
-
-
-def evaluate_final_time_l2():
-    model.eval()
-
-    with torch.no_grad():
-        x_test = torch.linspace(-L, L, 1000).view(-1, 1).to(device)
-        t_test = torch.full_like(x_test, T_max)
-
-        u_pred = model(x_test, t_test)
-        u_exact = exact_kawahara(x_test, t_test)
-
-        l2_error = torch.norm(u_pred - u_exact, 2) / torch.norm(u_exact, 2)
-
-    return l2_error.item()
-
-
-def evaluate_full_and_interior_l2():
-    model.eval()
-
-    with torch.no_grad():
-        x_diag = torch.linspace(-L, L, 1000).view(-1, 1).to(device)
-
-        margin = 4.0
-        interior = (x_diag.squeeze() > -L + margin) & (x_diag.squeeze() < L - margin)
-
-        t_fin = torch.full_like(x_diag, T_max)
-
-        u_pred = model(x_diag, t_fin)
-        u_exact = exact_kawahara(x_diag, t_fin)
-
-        err_full = relative_l2(u_pred, u_exact)
-        err_int = relative_l2(u_pred, u_exact, interior)
-
-    return err_full, err_int, margin
-
-
-def evaluate_space_time_l2(Nx=600, Nt=80):
-    model.eval()
-
-    with torch.no_grad():
-        x_grid = torch.linspace(-L, L, Nx).view(-1, 1).to(device)
-        t_grid = torch.linspace(0.0, T_max, Nt).view(-1, 1).to(device)
-
-        errors = []
-        exacts = []
-
-        for tv in t_grid:
-            t_col = torch.full_like(x_grid, tv.item())
-
-            u_pred = model(x_grid, t_col)
-            u_exact = exact_kawahara(x_grid, t_col)
-
-            errors.append((u_pred - u_exact).reshape(-1))
-            exacts.append(u_exact.reshape(-1))
-
-        errors = torch.cat(errors)
-        exacts = torch.cat(exacts)
-
-        st_l2 = torch.norm(errors, 2) / torch.norm(exacts, 2)
-
-    return st_l2.item()
-
-
-def evaluate_energy_drift():
-    model.eval()
-
-    with torch.no_grad():
-        t_energy_diag = torch.linspace(0.0, T_max, 80)
-        energy_values = []
-
-        for tv in t_energy_diag:
-            t_curr = torch.full_like(x_energy, tv.item())
-            u_curr = model(x_energy, t_curr)
-
-            E_curr = torch.sum(u_curr ** 2) * dx
-            energy_values.append(E_curr.item())
-
-        energy_values = np.array(energy_values)
-        E0_np = E0.item()
-
-        rel_energy_drift = np.abs(energy_values - E0_np) / np.abs(E0_np)
-
-        max_energy_drift = np.max(rel_energy_drift)
-        mean_energy_drift = np.mean(rel_energy_drift)
-
-    return max_energy_drift, mean_energy_drift, t_energy_diag, rel_energy_drift
-
-
-def evaluate_pde_loss_fixed(N_eval=2000):
-    """
-    Финальная PDE residual loss на новых точках.
-    ВНИМАНИЕ: здесь снова считается u_xxxxx через AD.
-    """
-    model.eval()
-
-    t_eval = (torch.rand(N_eval, 1, device=device) * T_max).requires_grad_(True)
-    x_eval = ((torch.rand(N_eval, 1, device=device) * 2 * L) - L).requires_grad_(True)
-
-    residual = kawahara_residual_pinn(x_eval, t_eval)
-    loss_pde_eval = torch.mean(residual ** 2)
-
-    return loss_pde_eval.item()
-
-
-final_l2 = evaluate_final_time_l2()
-err_full, err_int, margin = evaluate_full_and_interior_l2()
-space_time_l2 = evaluate_space_time_l2(Nx=600, Nt=80)
-max_energy_drift, mean_energy_drift, t_energy_diag, rel_energy_drift = evaluate_energy_drift()
-final_pde_eval = evaluate_pde_loss_fixed(N_eval=2000)
-
-print("\n================ Kawahara standard PINN metrics ================")
-print(f"Training time seconds       : {training_time:.2f}")
-print(f"Final-time relative L2      : {final_l2:.6e}")
-print(f"Full-domain L2 at T={T_max} : {err_full:.6e}")
-print(f"Interior L2 at T={T_max}    : {err_int:.6e}  margin={margin}")
-print(f"Space-time L2               : {space_time_l2:.6e}")
-print(f"Final PDE eval loss         : {final_pde_eval:.6e}")
-print(f"Max energy drift            : {max_energy_drift:.6e}")
-print(f"Mean energy drift           : {mean_energy_drift:.6e}")
-print("=================================================================")
-
-
-# ==========================================================
-# 8b. ФУРЬЕ-АНАЛИЗ СПЕКТРА ОШИБКИ  (ЭТАП 3)
-#     Проверка тезиса о spectral bias:
-#     где по волновым числам сосредоточена ошибка?
-# ==========================================================
-def error_spectrum(exact_fn, N=2048):
-    """
-    Считает пространственный спектр ошибки и точного решения при t = T_max.
-    Использует глобальные L, T_max, device, model.
-    Возвращает:
-        k          - угловые волновые числа (rad/unit length)
-        P_err      - сырой спектр мощности ошибки
-        P_exact    - сырой спектр мощности точного решения
-    """
-    model.eval()
-    with torch.no_grad():
-        x = torch.linspace(-L, L, N).view(-1, 1).to(device)
-        t = torch.full_like(x, T_max)
-        u_pred = model(x, t).cpu().numpy().ravel()
-        u_exact = exact_fn(x, t).cpu().numpy().ravel()
-
-    err = u_pred - u_exact
-    dx_fft = (2.0 * L) / (N - 1)
-
-    P_err = np.abs(np.fft.rfft(err)) ** 2
-    P_exact = np.abs(np.fft.rfft(u_exact)) ** 2
-    k = np.fft.rfftfreq(N, d=dx_fft) * 2.0 * np.pi  # угловые волновые числа
-
-    return k, P_err, P_exact
-
-
-def spectral_centroid(k, P):
-    """Центр тяжести спектра по волновому числу: sum(k*P)/sum(P)."""
-    return float(np.sum(k * P) / (np.sum(P) + 1e-30))
-
-
-# --- вычисление ---
-k_fft, P_err, P_exact = error_spectrum(exact_kawahara, N=2048)
-
-centroid_err = spectral_centroid(k_fft, P_err)
-centroid_exact = spectral_centroid(k_fft, P_exact)
-ratio = centroid_err / (centroid_exact + 1e-30)
-
-# доля энергии ошибки в "высоких" частотах (k > 2*centroid_exact)
-hi_mask = k_fft > (2.0 * centroid_exact)
-hi_frac_err = float(np.sum(P_err[hi_mask]) / (np.sum(P_err) + 1e-30))
-hi_frac_exact = float(np.sum(P_exact[hi_mask]) / (np.sum(P_exact) + 1e-30))
-
-print("\n--- Error spectrum diagnostics (Kawahara) ---")
-print(f"Spectral centroid of ERROR    : k = {centroid_err:.4f}")
-print(f"Spectral centroid of SOLUTION : k = {centroid_exact:.4f}")
-print(f"Ratio (error / solution)      : {ratio:.3f}")
-print(f"High-k energy fraction ERROR  : {hi_frac_err:.4f}")
-print(f"High-k energy fraction SOLUT. : {hi_frac_exact:.4f}")
-print("  (high-k defined as k > 2 * solution centroid)")
-
-# --- график (нормированные на максимум для сравнения формы) ---
-P_err_n = P_err / (P_err.max() + 1e-30)
-P_exact_n = P_exact / (P_exact.max() + 1e-30)
+high_k_fraction_exact = float(
+    np.sum(power_exact[high_k_mask]) / (np.sum(power_exact) + 1e-30)
+)
+
+print("\n--- Error spectrum diagnostics ---")
+print(f"Spectral centroid of error    : k = {centroid_error:.6f}")
+print(f"Spectral centroid of solution : k = {centroid_exact:.6f}")
+print(f"Ratio error/solution          : {centroid_ratio:.6f}")
+print(f"High-k energy fraction error  : {high_k_fraction_error:.6f}")
+print(f"High-k energy fraction solut. : {high_k_fraction_exact:.6f}")
+print("High-k is defined as k > 2 * solution centroid.")
+
+
+# ============================================================
+# 6. SAVE METRICS
+# ============================================================
+
+metrics_path = RESULTS_DIR / "kawahara_error_spectrum_metrics.txt"
+
+with open(metrics_path, "w", encoding="utf-8") as f:
+    f.write("Kawahara Fourier error-spectrum diagnostic\n")
+    f.write(f"Model file                         = {model_path}\n")
+    f.write(f"N_FFT                              = {N_FFT}\n")
+    f.write(f"Spectral centroid of error         = {centroid_error:.10f}\n")
+    f.write(f"Spectral centroid of solution      = {centroid_exact:.10f}\n")
+    f.write(f"Ratio error/solution               = {centroid_ratio:.10f}\n")
+    f.write(f"High-k energy fraction error       = {high_k_fraction_error:.10f}\n")
+    f.write(f"High-k energy fraction solution    = {high_k_fraction_exact:.10f}\n")
+
+
+# ============================================================
+# 7. SAVE FIGURE
+# ============================================================
+
+power_error_norm = power_error / (power_error.max() + 1e-30)
+power_exact_norm = power_exact / (power_exact.max() + 1e-30)
 
 plt.figure(figsize=(8, 5))
-plt.semilogy(k_fft, P_exact_n, 'k-', lw=2, label='Exact solution spectrum')
-plt.semilogy(k_fft, P_err_n, 'r--', lw=2, label='Error spectrum')
-plt.axvline(centroid_err, color='r', ls=':', alpha=0.7,
-            label=f'Error centroid k={centroid_err:.2f}')
-plt.axvline(centroid_exact, color='k', ls=':', alpha=0.7,
-            label=f'Solution centroid k={centroid_exact:.2f}')
+plt.semilogy(k_fft, power_exact_norm, linewidth=2, label="Exact solution spectrum")
+plt.semilogy(k_fft, power_error_norm, linestyle="--", linewidth=2, label="Error spectrum")
+plt.axvline(
+    centroid_exact,
+    linestyle=":",
+    alpha=0.8,
+    label=f"Solution centroid k={centroid_exact:.2f}",
+)
+plt.axvline(
+    centroid_error,
+    linestyle=":",
+    alpha=0.8,
+    label=f"Error centroid k={centroid_error:.2f}",
+)
 plt.xlabel("Wavenumber $k$")
 plt.ylabel("Normalized power spectrum")
 plt.title("Kawahara: spectral content of error vs solution")
 plt.xlim(0, 10)
 plt.ylim(1e-12, 2.0)
-plt.grid(True, which='both', alpha=0.3)
+plt.grid(True, which="both", alpha=0.3)
 plt.legend(fontsize=9)
 plt.tight_layout()
-plt.savefig("kawahara_error_spectrum.png", dpi=150)
-plt.show()
 
-# дозапись метрик спектра в файл
-with open("kawahara_standard_pinn_metrics.txt", "a", encoding="utf-8") as f:
-    f.write("\n--- Error spectrum diagnostics ---\n")
-    f.write(f"Spectral centroid of error    = {centroid_err:.6f}\n")
-    f.write(f"Spectral centroid of solution = {centroid_exact:.6f}\n")
-    f.write(f"Ratio error/solution          = {ratio:.6f}\n")
-    f.write(f"High-k energy fraction error  = {hi_frac_err:.6f}\n")
-    f.write(f"High-k energy fraction solut. = {hi_frac_exact:.6f}\n")
+figure_path = FIGURES_DIR / "kawahara_error_spectrum_hann.png"
+plt.savefig(figure_path, dpi=300, bbox_inches="tight")
+plt.close()
 
-
-# ==========================================
-# 9. ГРАФИКИ (профили, L2(t), energy drift)
-# ==========================================
-x_test = torch.linspace(-L, L, 1000).view(-1, 1).to(device)
-
-# L2(t)
-model.eval()
-
-with torch.no_grad():
-    t_grid = torch.linspace(0.0, T_max, 80)
-    interior = (x_test.squeeze() > -L + margin) & (x_test.squeeze() < L - margin)
-
-    l2_full_t = []
-    l2_int_t = []
-
-    for tv in t_grid:
-        t_col = torch.full_like(x_test, tv.item())
-
-        u_pred = model(x_test, t_col)
-        u_exact = exact_kawahara(x_test, t_col)
-
-        l2_full_t.append(relative_l2(u_pred, u_exact))
-        l2_int_t.append(relative_l2(u_pred, u_exact, interior))
-
-
-plt.figure(figsize=(8, 5))
-plt.plot(t_grid.cpu().numpy(), l2_full_t, 'r-o', ms=3, label='Full domain')
-plt.plot(t_grid.cpu().numpy(), l2_int_t, 'b-s', ms=3, label=f'Interior (|x|<{L-margin})')
-plt.xlabel("t")
-plt.ylabel("Relative $L_2$ error")
-plt.title("Kawahara standard PINN: error evolution in time")
-plt.yscale("log")
-plt.grid(True, which="both", alpha=0.3)
-plt.legend()
-plt.tight_layout()
-plt.savefig("kawahara_standard_pinn_l2_time.png", dpi=150)
-plt.show()
-
-
-# Energy drift
-plt.figure(figsize=(8, 5))
-plt.plot(t_energy_diag.cpu().numpy(), rel_energy_drift, 'k-o', ms=3)
-plt.xlabel("t")
-plt.ylabel("Relative energy drift")
-plt.title("Kawahara standard PINN: energy drift")
-plt.yscale("log")
-plt.grid(True, which="both", alpha=0.3)
-plt.tight_layout()
-plt.savefig("kawahara_standard_pinn_energy_drift.png", dpi=150)
-plt.show()
-
-
-# Profiles
-plt.figure(figsize=(12, 6))
-
-times_to_plot = [0.0, T_max / 2.0, T_max]
-colors = ['blue', 'green', 'red']
-
-with torch.no_grad():
-    for i, t_val in enumerate(times_to_plot):
-        t_plot = torch.full_like(x_test, t_val)
-
-        u_pred_plot = model(x_test, t_plot)
-        u_exact_plot = exact_kawahara(x_test, t_plot)
-
-        plt.plot(
-            x_test.cpu(),
-            u_exact_plot.cpu(),
-            color=colors[i],
-            linestyle='dashed',
-            linewidth=2,
-            label=f'Exact t={t_val:.2f}'
-        )
-
-        plt.plot(
-            x_test.cpu(),
-            u_pred_plot.cpu(),
-            color=colors[i],
-            linewidth=2,
-            label=f'Standard PINN t={t_val:.2f}'
-        )
-
-plt.title(f"Kawahara equation: standard PINN, L2 error={final_l2:.4e}")
-plt.xlabel("x")
-plt.ylabel("u(x,t)")
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-plt.savefig("kawahara_standard_pinn_profiles.png", dpi=150)
-plt.show()
-
-
-# ==========================================
-# 10. СОХРАНЕНИЕ
-# ==========================================
-torch.save(model.state_dict(), "kawahara_standard_pinn_model.pt")
-
-print("\nМетрики и графики сохранены:")
-print(" - kawahara_standard_pinn_metrics.txt")
-print(" - kawahara_error_spectrum.png   <-- НОВЫЙ (Этап 3)")
-print(" - kawahara_standard_pinn_l2_time.png")
-print(" - kawahara_standard_pinn_energy_drift.png")
-print(" - kawahara_standard_pinn_profiles.png")
+print("\nSaved outputs:")
+print(f"  - {metrics_path}")
+print(f"  - {figure_path}")
