@@ -7,7 +7,7 @@ import math
 import time
 import csv
 import gc
-
+from pathlib import Path
 
 # ============================================================
 # 0. GLOBAL SETTINGS
@@ -15,11 +15,12 @@ import gc
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Если хочешь быстрее проверить за час, оставь FAST_MODE = True.
-# Для финального запуска можно поставить FAST_MODE = False.
-FAST_MODE = True
+# Set FAST_MODE = True for a quick reduced-budget test.
+# Set FAST_MODE = False to reproduce the paper-scale results.
 
-SAVE_PLOTS = False   # если хочешь сохранять графики для каждого эксперимента, поставь True
+FAST_MODE = False
+
+SAVE_PLOTS = True   # если хочешь сохранять графики для каждого эксперимента, поставь True
 
 # Rosenau--KdV domain
 L = 20.0
@@ -50,7 +51,20 @@ else:
     N_PDE_EVAL = 1500
 
 ADAM_LR = 0.002
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+RESULTS_DIR = ROOT_DIR / "results" / "raw" / "rosenau"
+FIGURES_DIR = ROOT_DIR / "figures" / "generated" / "rosenau"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+
+CSV_FILE = RESULTS_DIR / "rosenau_kdv_ablation_results.csv"
 
 # ============================================================
 # 1. EXPERIMENT LIST
@@ -391,7 +405,7 @@ def save_plots(model, run_name, final_l2, margin, t_energy_diag, rel_energy_drif
     plt.grid(True, which="both", alpha=0.3)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(f"{run_name}_l2_time.png", dpi=150)
+    plt.savefig(FIGURES_DIR / f"{run_name}_l2_time.png", dpi=150)
     plt.close()
 
     # Energy drift
@@ -403,7 +417,7 @@ def save_plots(model, run_name, final_l2, margin, t_energy_diag, rel_energy_drif
     plt.yscale("log")
     plt.grid(True, which="both", alpha=0.3)
     plt.tight_layout()
-    plt.savefig(f"{run_name}_energy_drift.png", dpi=150)
+    plt.savefig(FIGURES_DIR / f"{run_name}_energy_drift.png", dpi=150)
     plt.close()
 
     # Profiles
@@ -444,7 +458,7 @@ def save_plots(model, run_name, final_l2, margin, t_energy_diag, rel_energy_drif
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig(f"{run_name}_profiles.png", dpi=150)
+    plt.savefig(FIGURES_DIR / f"{run_name}_profiles.png", dpi=150)
     plt.close()
 
 
@@ -668,7 +682,7 @@ def run_experiment(config):
     # ------------------------------
     # Save metrics to CSV
     # ------------------------------
-    csv_file = "rosenau_kdv_ablation_results.csv"
+    csv_file = CSV_FILE
 
     row = {
         "case": case,
@@ -738,4 +752,4 @@ for row in all_results:
     )
 
 print("=================================================================")
-print("Results saved to: rosenau_kdv_ablation_results.csv")
+print(f"Results saved to: {CSV_FILE}")
