@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the accompanying paper and archived software release."
+title: "Physics-Informed Neural Networks for Nonlinear Dispersive Equations"
+authors:
+  - family-names: "Koshkarbayev"
+    given-names: "Nurbol"
+    orcid: "https://orcid.org/0000-0003-2563-0693"
+version: 1.0.0
+date-released: 2026-06-28
+repository-code: "https://github.com/koshnurbol/pinn-nonlinear-dispersive-equations"
+license: "MIT"
+keywords:
+  - physics-informed neural networks
+  - PINNs
+  - nonlinear dispersive equations
+  - KdV equation
+  - BBM equation
+  - Kawahara equation
+  - Rosenau-KdV equation
+  - PyTorch
+  - scientific computing
+preferred-citation:
+  type: article
+  title: "Physics-Informed Neural Networks for Nonlinear Dispersive Equations"
+  authors:
+    - family-names: "Koshkarbayev"
+      given-names: "Nurbol"
+      orcid: "https://orcid.org/0000-0003-2563-0693"
+  year: 2026
