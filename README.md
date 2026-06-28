@@ -1,5 +1,5 @@
 # Physics-Informed Neural Networks for Nonlinear Dispersive Equations
-
+[![DOI](https://zenodo.org/badge/1282967436.svg)](https://doi.org/10.5281/zenodo.21001915)
 This repository contains the code accompanying the paper
 
 > **Physics-Informed Neural Networks for Nonlinear Dispersive Equations**  
@@ -183,14 +183,13 @@ a rigid phase shift.
 
 ## Code availability
 
-This repository contains the implementation used to generate the numerical
-results, ablation studies, seed-robustness tables, solution-profile figures,
-energy-drift diagnostics, and Kawahara spectral-error analysis reported in the
-accompanying manuscript.
+The implementation used to generate the numerical results, ablation studies,
+seed-robustness tables, solution-profile figures, energy-drift diagnostics, and
+Kawahara spectral-error analysis reported in the accompanying manuscript is
+available at:
 
-The repository is currently under preparation for public release. The archived
-version corresponding to the manuscript will be deposited on Zenodo and cited by
-DOI.
+```text
+https://github.com/koshnurbol/pinn-nonlinear-dispersive-equations
 
 ## License
 
@@ -199,6 +198,10 @@ cite the accompanying paper and the archived software release.
 
 ## Citation
 
-Citation metadata are provided in `CITATION.cff`. After the manuscript is
-accepted or a Zenodo DOI is assigned, this section will be updated with the final
-paper citation and archived software DOI.
+If you use this repository, please cite the accompanying paper and the archived
+software release:
+
+```text
+Koshkarbayev, N. (2026). Physics-Informed Neural Networks for Nonlinear
+Dispersive Equations (v1.0.0) [Computer software]. Zenodo.
+https://doi.org/10.5281/zenodo.21001916
