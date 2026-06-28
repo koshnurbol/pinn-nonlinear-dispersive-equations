@@ -6,6 +6,7 @@ import numpy as np
 import math
 import time
 import csv
+from pathlib import Path
 
 # ============================================================
 # 0. ABLATION FLAGS
@@ -14,7 +15,7 @@ import csv
 SEED = 42
 
 USE_INPUT_NORMALIZATION = True
-USE_ENERGY_LOSS = True
+USE_ENERGY_LOSS = False
 USE_LBFGS = True
 
 RUN_NAME = f"kawahara_norm_{USE_INPUT_NORMALIZATION}_energy_{USE_ENERGY_LOSS}_lbfgs_{USE_LBFGS}_seed_{SEED}"
@@ -22,6 +23,20 @@ RUN_NAME = f"kawahara_norm_{USE_INPUT_NORMALIZATION}_energy_{USE_ENERGY_LOSS}_lb
 torch.manual_seed(SEED)
 np.random.seed(SEED)
 
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+RESULTS_DIR = ROOT_DIR / "results" / "raw" / "kawahara"
+FIGURES_DIR = ROOT_DIR / "figures" / "generated" / "kawahara"
+MODELS_DIR = ROOT_DIR / "models"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
 # 1. EXACT KAWAHARA SOLITON
@@ -521,7 +536,7 @@ print("===========================================================")
 # 9. SAVE METRICS TO CSV
 # ============================================================
 
-csv_file = "kawahara_ablation_results.csv"
+csv_file = RESULTS_DIR / "kawahara_ablation_results.csv"
 
 row = {
     "run_name": RUN_NAME,
@@ -552,10 +567,18 @@ except FileExistsError:
 print(f"\nMetrics appended to {csv_file}")
 
 
+
 # ============================================================
-# 10. SAVE PLOTS
+# 10. SAVE TRAINED MODEL FOR DIAGNOSTICS
 # ============================================================
 
+model_path = MODELS_DIR / "kawahara_standard_pinn_model.pt"
+torch.save(model.state_dict(), model_path)
+
+print(f"Trained Kawahara model saved to {model_path}")
+# ============================================================
+# 11. SAVE PLOTS
+# ============================================================
 # L2(t)
 model.eval()
 
@@ -588,7 +611,7 @@ plt.yscale("log")
 plt.grid(True, which="both", alpha=0.3)
 plt.legend()
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_l2_time.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_l2_time.png", dpi=150)
 plt.show()
 
 
@@ -601,7 +624,7 @@ plt.title(f"Kawahara energy drift: {RUN_NAME}")
 plt.yscale("log")
 plt.grid(True, which="both", alpha=0.3)
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_energy_drift.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_energy_drift.png", dpi=150)
 plt.show()
 
 
@@ -643,5 +666,5 @@ plt.ylabel("u(x,t)")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_profiles.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_profiles.png", dpi=150)
 plt.show()
