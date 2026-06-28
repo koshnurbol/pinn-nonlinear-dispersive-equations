@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 import csv
+from pathlib import Path
 
 # ============================================================
 # 0. ABLATION FLAGS
@@ -20,7 +21,18 @@ RUN_NAME = f"kdv_norm_{USE_INPUT_NORMALIZATION}_energy_{USE_ENERGY_LOSS}_lbfgs_{
 
 torch.manual_seed(SEED)
 np.random.seed(SEED)
+# ============================================================
+# OUTPUT DIRECTORIES
+# ============================================================
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+
+RESULTS_DIR = ROOT_DIR / "results" / "raw" / "kdv"
+FIGURES_DIR = ROOT_DIR / "figures" / "generated" / "kdv"
+
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================
 # 1. EXACT KDV SOLITON
@@ -482,7 +494,7 @@ print("=======================================================")
 # 9. SAVE METRICS TO CSV
 # ============================================================
 
-csv_file = "kdv_ablation_results.csv"
+csv_file = RESULTS_DIR / "kdv_ablation_results.csv"
 
 row = {
     "run_name": RUN_NAME,
@@ -549,7 +561,7 @@ plt.yscale("log")
 plt.grid(True, which="both", alpha=0.3)
 plt.legend()
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_l2_time.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_l2_time.png", dpi=150)
 plt.show()
 
 
@@ -562,7 +574,7 @@ plt.title(f"KdV energy drift: {RUN_NAME}")
 plt.yscale("log")
 plt.grid(True, which="both", alpha=0.3)
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_energy_drift.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_energy_drift.png", dpi=150)
 plt.show()
 
 
@@ -604,5 +616,5 @@ plt.ylabel("u(x,t)")
 plt.legend()
 plt.grid(True)
 plt.tight_layout()
-plt.savefig(f"{RUN_NAME}_profiles.png", dpi=150)
+plt.savefig(FIGURES_DIR / f"{RUN_NAME}_profiles.png", dpi=150)
 plt.show()
