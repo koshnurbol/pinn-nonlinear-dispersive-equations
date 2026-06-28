@@ -132,7 +132,25 @@ phase shift.
 - The Rosenau–KdV script has a `FAST_MODE` flag. The default (`FAST_MODE = False`)
   reproduces the paper results; setting it to `True` runs a reduced-budget version
   for quick checks and will not match the published numbers exactly.
+  
+## Code availability
+
+This repository contains the implementation used to generate the numerical
+results, ablation studies, seed-robustness tables, solution-profile figures,
+energy-drift diagnostics, and Kawahara spectral-error analysis reported in the
+accompanying manuscript.
+
+The repository is currently under preparation for public release. The archived
+version corresponding to the manuscript will be deposited on Zenodo and cited by
+DOI.
 
 ## License
 
-Released for academic use. If you use this code, please cite the paper above.
+This code is released under the MIT License. If you use this repository, please
+cite the accompanying paper and the archived software release.
+
+## Citation
+
+Citation metadata are provided in `CITATION.cff`. After the manuscript is
+accepted or a Zenodo DOI is assigned, this section will be updated with the final
+paper citation and archived software DOI.
